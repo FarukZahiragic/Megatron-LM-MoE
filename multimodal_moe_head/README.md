@@ -14,8 +14,17 @@ against the ground-truth modality (derived from the label token-id range). The
 LM loss is the usual per-token cross-entropy, computed *within* the chosen
 expert's vocab via `vocab_parallel_cross_entropy`.
 
-> For the full story behind this module — the design decisions, training runs,
-> dead-ends, and the eval/visualization tooling — see [`JOURNAL.md`](JOURNAL.md).
+## Background
+
+This package is a port of **Method II** from a semester project: a two-expert
+modality-routed output head that materializes logits for only one modality per
+token (~50% output-layer compute/memory under EP=2). In a prior 1B climb-mix
+ablation (dense backbone + this head), per-rank peak reserved memory dropped
+~34% (~16 GB) and mean iteration time ~9%, with LM/text/vision losses tracking
+the dense baseline.
+
+It is intended as an **opt-in baseline for Apertus 2** — gated behind
+`--moe-output-head` so dense training is unchanged when the flag is off.
 
 ## Design at a glance
 
@@ -30,10 +39,7 @@ expert's vocab via `vocab_parallel_cross_entropy`.
   inflating the reported LM-loss scalar. Mirrors Megatron's `MTPLossAutoScaler`.
 - **Teacher forcing** (`teacher_force_steps`). While `current_step <
   teacher_force_steps`, tokens are dispatched by ground-truth modality instead of
-  the router's argmax. For this hard-routing head the recommended default is
-  **always-on** (`1000000000`); turning it off only ever feeds misrouted tokens a
-  garbage-target gradient and never helps the router (which trains from the aux
-  loss either way). See the `moe-teacher-force-default` note for the full rationale.
+  the router's argmax. Default is **always-on** (`1000000000`).
 - **Expert parallelism.**
   - `EP=1` (replicated): both projections on every rank; each rank handles all
     its tokens locally. Default, safest.
@@ -51,67 +57,84 @@ experts.py           OutputProjectionExperts: the two ColumnParallelLinear heads
 head.py              MoEOutputHead: routing, all-to-all (EP=2), per-token loss
 moe_gpt_model.py     MoEGPTModel (GPTModel subclass) + AuxLossAutoScaler
 integration.py       build_moe_output_head() factory + integration notes
-data/                training data helpers
+data/
   mock.py              mock text+vision batches for smoke tests
   interleaved.py       1-text + 1-vision micro-batch interleaving for real data
-tests/               EP=1 (replicated) and EP=2 correctness tests
-scripts/             SLURM training launchers (submit-*.sh, see below)
-retokenize/          re-tokenize the ClimbMix corpus with the Apertus tokenizer
-hf_export/           convert an EP=2 MoE checkpoint to an HF ApertusMoE model (see CONVERSION.md)
+tests/               EP=1 and EP=2 GPU correctness tests (see below)
 ```
 
 ## How it plugs into Megatron
 
-The head is wired into the stock GPT pipeline **without patching core files** in
-ways that affect dense training — the hooks live in the repo-root trainer:
+The head is wired into the stock GPT pipeline **without patching core
+`megatron/` files**:
 
-- `pretrain_gpt.py` — `add_moe_head_args()` (the `--moe-output-head`,
-  `--moe-teacher-force-steps`, `--moe-router-loss-coeff` flags) and
-  `_adaptive_gpt_builder()` (selects `moe_gpt_builder` when `--moe-output-head`).
-- `gpt_builders.py` — `moe_gpt_builder()` constructs an `MoEGPTModel`.
+- `pretrain_gpt.py` — `add_moe_head_args()`, `_adaptive_gpt_builder()`, router
+  metrics in `loss_func`, optional `--moe-mock-multimodal` / interleaved data hooks.
+- `gpt_builders.py` — `moe_gpt_builder()` constructs an `MoEGPTModel`. Keeps the
+  backbone dense by nulling `config.num_moe_experts` only around the layer-spec
+  build; `--num-experts 2` still creates EP groups for the output head.
 
-`MoEGPTModel` returns a `[b, s]` per-token loss — exactly the shape
-`loss_func` in `pretrain_gpt.py` already expects — so the rest of the training
-loop is unchanged.
+`MoEGPTModel` returns a `[b, s]` per-token loss — the shape `loss_func` already
+expects — so the rest of the training loop is unchanged.
 
-## Training
-
-Each launcher is a self-contained `sbatch`-able script. The `1b-climbmix` pair is
-the current Stage-1 setup (32 nodes, GBS 256, WSD LR):
+## Usage
 
 ```bash
-# dense baseline
-sbatch multimodal_moe_head/scripts/submit-apertus-1p5-1b-climbmix-dense-stage1.sh
-# MoE head (EP=2)
-sbatch multimodal_moe_head/scripts/submit-apertus-1p5-1b-climbmix-moe-stage1.sh
+# EP=2 (one expert per rank)
+--moe-output-head --num-experts 2 --expert-model-parallel-size 2 \
+  --moe-text-vocab-size 131072 --moe-router-loss-coeff 0.01 \
+  --moe-teacher-force-steps 1000000000
+
+# EP=1 (both experts replicated per rank) — omit --expert-model-parallel-size
+
+# Mock multimodal smoke data (with --mock-data)
+--moe-mock-multimodal
 ```
 
-The dense/moe scripts differ only by the `USE_MOE_HEAD` default; both honour an
-override (`USE_MOE_HEAD=true|false`).
-
-| Script | Purpose |
-|--------|---------|
-| `submit-apertus-1p5-1b-climbmix-dense-stage1.sh` | 1B dense baseline, ClimbMix |
-| `submit-apertus-1p5-1b-climbmix-moe-stage1.sh`   | 1B MoE head (EP=2), ClimbMix |
-| `submit-apertus-300m-climbmix-stage1.sh`         | 300M ClimbMix |
-| `submit-apertus-1p5-1b-dense-text.sh` / `...-300m-dense-text.sh` | earlier text-only runs |
-| `submit-apertus-1p5-1b-moe-head-stage1.sh`       | earlier 1B MoE run |
-| `submit-apertus-300m-moe-head-stage1.sh`         | 300M MoE Stage-1 |
-| `submit-apertus-300m{,-moe-head,-standard-head}-mock.sh`, `submit-apertus-8b-*-mock.sh` | mock-data smoke tests (no real dataset) |
-| `submit-apertus-300m.sh` | **production dense reference — do not edit** |
+Modality boundary: `--moe-text-vocab-size` (default 131072), or `base_vocab_size`
+from an omni tokenizer if present.
 
 ## Tests
 
+GPU correctness tests live in `tests/`. Run from the **repo root** on a GPU node
+(CUDA + NCCL required):
+
 ```bash
-bash multimodal_moe_head/tests/run_test_replicated.sh   # EP=1
-bash multimodal_moe_head/tests/run_test_ep2.sh          # EP=2 (2 ranks)
+cd /path/to/Megatron-LM-MoE
+export PYTHONPATH=$PWD
+
+# EP=1 smoke (1 GPU)
+RANK=0 LOCAL_RANK=0 WORLD_SIZE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29501 \
+  python -m pytest multimodal_moe_head/tests/test_replicated.py -v -s
+
+# EP=2 full suite (4 GPUs, EP=2 + DP=2)
+torchrun --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29502 \
+  -m pytest multimodal_moe_head/tests/test_ep2.py -v -s
 ```
 
-## Data tooling
+### Verified (Clariden, GH200)
 
-- `retokenize/` — re-tokenize ClimbMix (GPT-2 parquet → Apertus tokens + EOS).
-  `_run_full.sbatch` runs all 100 shards (≈32.7B Apertus tokens).
-- `hf_export/` — convert an EP=2 MoE dist-checkpoint to an HF `ApertusMoEForCausalLM`
-  so it can be scored by lm-evaluation-harness. Full procedure in
-  [`hf_export/CONVERSION.md`](hf_export/CONVERSION.md); `_convert_1b_moe_62k.sbatch`
-  (MoE) and `_gen_1b_dense_62k.sbatch` (dense) are the current job scripts.
+| Suite | GPUs | Result |
+|-------|------|--------|
+| `test_replicated.py` | 1 | 7/7 passed |
+| `test_ep2.py` | 4 | 19/19 passed |
+
+These tests verify routing, numerical loss parity (hand-rolled CE reference),
+EP=2 all-to-all dispatch/combine, and gradient flow. They exercise
+`MoEOutputHead` directly — not the full `pretrain_gpt.py` training loop.
+
+### Optional follow-up
+
+A short end-to-end `pretrain_gpt.py` run with `--moe-output-head --mock-data
+--moe-mock-multimodal` would additionally confirm model build, `_postprocess`
+integration, and metric logging in the real trainer. Not required for the baseline.
+
+## Known limitations
+
+- **Generation** not implemented (`labels=None` raises); training/eval-with-labels only.
+- **MTP** not supported (assert in `MoEGPTModel`).
+- **Load balance:** EP=2 with one text + one VA expert idles the VA rank under
+  ~90/10 text/multimodal mixtures. Generalizing to more text experts or EP=1
+  for skewed mixes is a natural follow-up.
+- **Data pipeline:** full omni tokenizer / interleaved multimodal loaders are not
+  ported in this fork; mock + interleaved hooks are included for testing.
