@@ -113,6 +113,94 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
     return model
 
 
+def moe_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    """Build a GPTModel with the two-expert modality-routed MoE output head.
+
+    Mirrors ``gpt_builder`` but returns an ``MoEGPTModel`` whose dense output
+    projection is replaced by a text expert + vision/audio expert selected by a
+    learned top-1 router (see ``multimodal_moe_head``).
+
+    The transformer BACKBONE stays dense. ``--num-experts 2`` is required only to
+    satisfy Megatron's EP>1 validation and to create the expert-parallel process
+    groups used by the *output head* (arguments.py asserts num_experts is not None
+    when expert_model_parallel_size > 1). To stop that flag from also turning the
+    transformer FFN into an MoE, we null ``config.num_moe_experts`` for the
+    layer-spec build only, then restore it so the head's expert params still use
+    the expert-data-parallel groups.
+    """
+    from multimodal_moe_head.config import MoEOutputHeadConfig
+    from multimodal_moe_head.moe_gpt_model import MoEGPTModel
+
+    print_rank_0('building MoE-output-head GPT model ...')
+    if config is None:
+        if args.yaml_cfg is not None:
+            config = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            config = core_transformer_config_from_args(args)
+
+    # Modality boundary: prefer an omni tokenizer's base_vocab_size if present,
+    # otherwise fall back to the explicit --moe-text-vocab-size arg.
+    text_vocab_size = getattr(args, 'base_vocab_size', None) or args.moe_text_vocab_size
+    head_config = MoEOutputHeadConfig(
+        total_vocab_size=args.padded_vocab_size,
+        text_vocab_size=text_vocab_size,
+        router_loss_coeff=getattr(args, 'moe_router_loss_coeff', 0.01),
+        teacher_force_steps=getattr(args, 'moe_teacher_force_steps', 0),
+        expert_parallel_size=getattr(args, 'expert_model_parallel_size', 1),
+        log_router_inputs=getattr(args, 'moe_log_router_inputs', 0),
+    )
+
+    assert not args.use_legacy_models, "--moe-output-head requires the core GPTModel path."
+    assert args.mtp_num_layers is None, (
+        "--moe-output-head is incompatible with MTP (--mtp-num-layers)."
+    )
+
+    if args.spec is not None:
+        transformer_layer_spec = import_module(args.spec)
+    else:
+        use_te = args.transformer_impl == "transformer_engine"
+        if args.experimental_attention_variant is not None:
+            transformer_layer_spec = (
+                get_transformer_block_with_experimental_attention_variant_spec(
+                    config=config, vp_stage=vp_stage
+                )
+            )
+        elif args.heterogeneous_layers_config_path is not None:
+            assert not (config.transformer_impl == "inference_optimized")
+            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
+        else:
+            # Deliberately DROP the `elif args.num_experts:` FFN-MoE branch from
+            # gpt_builder: the backbone must stay dense. Null num_moe_experts only
+            # for the spec build so the dense layer spec is produced, then restore.
+            _saved_num_moe_experts = config.num_moe_experts
+            config.num_moe_experts = None
+            try:
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+            finally:
+                config.num_moe_experts = _saved_num_moe_experts
+
+    model = MoEGPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base,
+        rope_scaling=args.use_rope_scaling,
+        mtp_block_spec=None,
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
+        head_config=head_config,
+    )
+
+    return model
+
+
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
 

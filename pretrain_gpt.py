@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from gpt_builders import gpt_builder
+from gpt_builders import gpt_builder, moe_gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -30,7 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector, unwrap_model
 from megatron.training import (
     get_args,
     get_timers,
@@ -60,6 +60,64 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def add_moe_head_args(parser):
+    """Extra CLI arguments for the two-expert modality-routed MoE output head.
+
+    All flags are opt-in; without ``--moe-output-head`` the trainer behaves
+    exactly as stock GPT.
+    """
+    group = parser.add_argument_group('MoE output head')
+    group.add_argument('--moe-output-head', action='store_true',
+                       help='Replace the standard LM head with the two-expert '
+                            'modality-routed MoE output head. Requires '
+                            '--num-experts 2 (to create the EP groups) and, for '
+                            'EP=2, --expert-model-parallel-size 2.')
+    group.add_argument('--moe-text-vocab-size', type=int, default=131072,
+                       help='Boundary between the text block [0, N) and the '
+                            'vision/audio block [N, padded_vocab_size). Used only '
+                            'when the tokenizer does not provide base_vocab_size.')
+    group.add_argument('--moe-teacher-force-steps', type=int, default=10**9,
+                       help='Steps of teacher-forced (ground-truth-modality) '
+                            'routing before switching to the learned router. '
+                            'Default (10^9) is effectively always-on.')
+    group.add_argument('--moe-router-loss-coeff', type=float, default=0.01,
+                       help='Coefficient for the router cross-entropy auxiliary loss.')
+    group.add_argument('--moe-log-router-inputs', type=int, default=0,
+                       help='Diagnostic: log the per-sequence modality of the first '
+                            'N micro-batches each rank receives (0 = off).')
+    group.add_argument('--moe-mock-multimodal', action='store_true',
+                       help='With --mock-data, emit a ~50/50 text + vision/audio '
+                            'token mix so the VA expert is exercised. Testing only.')
+    group.add_argument('--moe-interleave-modality-data', action='store_true',
+                       help='Build a text blend and a vision blend separately and '
+                            'interleave them 1:1 (even sample idx -> text, odd -> '
+                            'vision). With MBS=2 every micro-batch is 1 text + 1 '
+                            'vision sample. Requires --moe-text-data-path and '
+                            '--moe-vision-data-path.')
+    group.add_argument('--moe-text-data-path', nargs='*', default=None,
+                       help='Dataset prefixes (and optional weights) for the TEXT '
+                            'blend; same format as --data-path.')
+    group.add_argument('--moe-vision-data-path', nargs='*', default=None,
+                       help='Dataset prefixes (and optional weights) for the VISION '
+                            'blend; same format as --data-path.')
+    return parser
+
+
+def _adaptive_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    """Select gpt_builder or moe_gpt_builder based on --moe-output-head."""
+    if getattr(args, 'moe_output_head', False):
+        return moe_gpt_builder(args, pre_process, post_process, vp_stage, config, pg_collection)
+    return gpt_builder(args, pre_process, post_process, vp_stage, config, pg_collection)
+
+
+def _extra_args_provider(parser):
+    """Chain the MoE-head args with the optional ModelOpt args."""
+    parser = add_moe_head_args(parser)
+    if has_nvidia_modelopt:
+        parser = add_modelopt_args(parser)
+    return parser
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -226,6 +284,22 @@ def loss_func(
             fatal=False,
         )
 
+    # MoE output head: surface router CE loss + routing-quality metrics. Each
+    # entry is a [numerator, denominator] pair so the data-parallel-group
+    # reduction (Sum num / Sum den) yields an exact token-weighted global value.
+    if model is not None and getattr(args, 'moe_output_head', False):
+        _unwrapped = unwrap_model(model)
+        _router_loss = getattr(_unwrapped, '_moe_router_loss', None)
+        if _router_loss is not None:
+            report['moe_router_loss'] = torch.stack([
+                _router_loss.view(1).float(),
+                torch.ones(1, device=_router_loss.device),
+            ])
+        _head_stats = getattr(_unwrapped, '_moe_head_stats', None)
+        if _head_stats is not None:
+            for stat_name, stat_val in _head_stats.items():
+                report[stat_name] = stat_val.view(-1)
+
     return loss, num_tokens, report
 
 
@@ -356,6 +430,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """
     args = get_args()
 
+    # Synthetic multimodal mock data: patch the mock dataset to emit a text/VA
+    # token mix so the MoE head's vision/audio expert is actually exercised.
+    if getattr(args, 'moe_mock_multimodal', False):
+        assert args.mock_data, "--moe-mock-multimodal requires --mock-data"
+        from multimodal_moe_head.data import enable_multimodal_mock
+        enable_multimodal_mock(text_fraction=0.5)
+
     config = core_gpt_dataset_config_from_args(args)
 
 
@@ -374,6 +455,36 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence)
+
+    # Strict 1:1 modality interleaving: build a text blend and a vision blend
+    # separately and interleave them so every MBS=2 micro-batch is 1 text + 1
+    # vision sample (see multimodal_moe_head/data/interleaved.py).
+    if getattr(args, 'moe_interleave_modality_data', False):
+        from megatron.core.datasets.utils import get_blend_from_list
+        from multimodal_moe_head.data import build_interleaved_modality_datasets
+
+        assert args.moe_text_data_path and args.moe_vision_data_path, (
+            "--moe-interleave-modality-data requires both --moe-text-data-path "
+            "and --moe-vision-data-path"
+        )
+        if args.micro_batch_size != 2:
+            print_rank_0(
+                f"WARNING: --moe-interleave-modality-data assumes MBS=2 for a 1 text "
+                f"+ 1 vision split per micro-batch, but micro_batch_size="
+                f"{args.micro_batch_size}."
+            )
+        train_ds, valid_ds, test_ds = build_interleaved_modality_datasets(
+            dataset_type,
+            train_val_test_num_samples,
+            is_dataset_built,
+            config,
+            text_blend=get_blend_from_list(args.moe_text_data_path),
+            vision_blend=get_blend_from_list(args.moe_vision_data_path),
+            split=args.split,
+        )
+        print_rank_0("> finished creating interleaved modality GPT datasets ...")
+        return train_ds, valid_ds, test_ds
+
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type, train_val_test_num_samples, is_dataset_built, config
     ).build()
@@ -413,11 +524,11 @@ if __name__ == "__main__":
 
     pretrain(
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
+        partial(model_provider, _adaptive_gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=_extra_args_provider,
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
